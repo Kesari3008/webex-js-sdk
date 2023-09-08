@@ -1,5 +1,0 @@
-package-lock.json -diff
-
-packages/* linguist-vendored=false
-packages/** linguist-vendored=false
-packages/**/* linguist-vendored=false

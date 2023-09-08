@@ -1,8 +1,0 @@
-docs
-patches
-coverage
-.circleci
-.github
-.yarn
-docker
-documentation
