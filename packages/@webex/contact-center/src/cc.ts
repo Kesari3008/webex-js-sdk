@@ -25,6 +25,7 @@ import {
   UploadLogsResponse,
   UpdateDeviceTypeResponse,
   GenericError,
+  ConfigFlags,
 } from './types';
 import {
   READY,
@@ -59,9 +60,9 @@ import {ITask, TASK_EVENTS, TaskResponse, DialerPayload} from './services/task/t
 import MetricsManager from './metrics/MetricsManager';
 import {METRIC_EVENT_NAMES} from './metrics/constants';
 import {Failure} from './services/core/GlobalTypes';
-import EntryPoint from './services/EntryPoint';
-import AddressBook from './services/AddressBook';
-import Queue from './services/Queue';
+import {EntryPoint} from './services/EntryPoint';
+import {AddressBook} from './services/AddressBook';
+import {Queue} from './services/Queue';
 import {ApiAIAssistant} from './services/ApiAiAssistant';
 import type {
   EntryPointListResponse,
@@ -318,7 +319,7 @@ export default class ContactCenter extends WebexPlugin implements IContactCenter
    * });
    * ```
    */
-  private queue: Queue;
+  public queue: Queue;
 
   /**
    * API instance for AI Assistant operations such as transcript controls.
@@ -365,8 +366,10 @@ export default class ContactCenter extends WebexPlugin implements IContactCenter
       this.services.webSocketManager.on('message', this.handleWebsocketMessage);
 
       this.webCallingService = new WebCallingService(this.$webex);
+      this.apiAIAssistant = new ApiAIAssistant(this.$webex);
       this.metricsManager = MetricsManager.getInstance({webex: this.$webex});
       this.taskManager = TaskManager.getTaskManager(
+        this.apiAIAssistant,
         this.services.contact,
         this.webCallingService,
         this.services.webSocketManager
@@ -378,9 +381,6 @@ export default class ContactCenter extends WebexPlugin implements IContactCenter
       this.entryPoint = new EntryPoint(this.$webex);
       this.addressBook = new AddressBook(this.$webex, () => this.agentConfig?.addressBookId);
       this.queue = new Queue(this.$webex);
-      this.apiAIAssistant = new ApiAIAssistant(this.$webex, () => this.agentConfig);
-
-      // Initialize logger
       LoggerProxy.initialize(this.$webex.logger);
     });
   }
@@ -702,49 +702,61 @@ export default class ContactCenter extends WebexPlugin implements IContactCenter
       module: CC_FILE,
       method: METHODS.CONNECT_WEBSOCKET,
     });
-
     try {
-      const data = (await this.services.webSocketManager.initWebSocket({
-        body: this.getConnectionConfig(),
-      })) as WelcomeEvent;
-
-      const agentId = data.agentId;
-      const orgId = this.$webex.credentials.getOrgId();
-      this.agentConfig = await this.services.config.getAgentConfig(orgId, agentId);
-
-      LoggerProxy.log(`Agent config is fetched successfully`, {
-        module: CC_FILE,
-        method: METHODS.CONNECT_WEBSOCKET,
-      });
-
-      // TODO: Make profile a singleton to make it available throughout app/sdk so we dont need to inject info everywhere
-      this.taskManager.setWrapupData(this.agentConfig.wrapUpData);
-      this.taskManager.setAgentId(this.agentConfig.agentId);
-      this.taskManager.setWebRtcEnabled(this.agentConfig.webRtcEnabled);
-
-      if (
-        this.agentConfig.webRtcEnabled &&
-        this.agentConfig.loginVoiceOptions.includes(LoginOption.BROWSER)
-      ) {
-        try {
-          await this.$webex.internal.mercury.connect();
-          LoggerProxy.log('Authentication: webex.internal.mercury.connect successful', {
+      return this.services.webSocketManager
+        .initWebSocket({
+          body: this.getConnectionConfig(),
+        })
+        .then(async (data: WelcomeEvent) => {
+          const agentId = data.agentId;
+          const orgId = this.$webex.credentials.getOrgId();
+          this.agentConfig = await this.services.config.getAgentConfig(orgId, agentId);
+          LoggerProxy.log(`Agent config is fetched successfully`, {
             module: CC_FILE,
             method: METHODS.CONNECT_WEBSOCKET,
           });
-        } catch (error) {
-          LoggerProxy.error(`Error occurred during mercury.connect() ${error}`, {
-            module: CC_FILE,
-            method: METHODS.CONNECT_WEBSOCKET,
-          });
-        }
-      }
 
-      if (this.$config && this.$config.allowAutomatedRelogin) {
-        await this.silentRelogin();
-      }
+          const configFlags: ConfigFlags = {
+            isEndTaskEnabled: this.agentConfig.isEndTaskEnabled,
+            isEndConsultEnabled: this.agentConfig.isEndConsultEnabled,
+            webRtcEnabled: this.agentConfig.webRtcEnabled,
+            autoWrapup: this.agentConfig.wrapUpData?.wrapUpProps?.autoWrapup ?? false,
+          };
+          this.taskManager.setConfigFlags(configFlags);
+          // TODO: Make profile a singleton to make it available throughout app/sdk so we dont need to inject info everywhere
+          this.taskManager.setWrapupData(this.agentConfig.wrapUpData);
+          this.taskManager.setAgentId(this.agentConfig.agentId);
+          this.taskManager.setWebRtcEnabled(this.agentConfig.webRtcEnabled);
+          this.apiAIAssistant.setAIFeatureFlags(this.agentConfig.aiFeature);
 
-      return this.agentConfig;
+          if (
+            this.agentConfig.webRtcEnabled &&
+            this.agentConfig.loginVoiceOptions.includes(LoginOption.BROWSER)
+          ) {
+            this.$webex.internal.mercury
+              .connect()
+              .then(() => {
+                LoggerProxy.log('Authentication: webex.internal.mercury.connect successful', {
+                  module: CC_FILE,
+                  method: METHODS.CONNECT_WEBSOCKET,
+                });
+              })
+              .catch((error) => {
+                LoggerProxy.error(`Error occurred during mercury.connect() ${error}`, {
+                  module: CC_FILE,
+                  method: METHODS.CONNECT_WEBSOCKET,
+                });
+              });
+          }
+          if (this.$config && this.$config.allowAutomatedRelogin) {
+            await this.silentRelogin();
+          }
+
+          return this.agentConfig;
+        })
+        .catch((error) => {
+          throw error;
+        });
     } catch (error) {
       LoggerProxy.error(`Error during register: ${error}`, {
         module: CC_FILE,
@@ -794,11 +806,7 @@ export default class ContactCenter extends WebexPlugin implements IContactCenter
         METRIC_EVENT_NAMES.STATION_LOGIN_FAILED,
       ]);
 
-      const dialPlanEntries = this.agentConfig?.dialPlan?.dialPlanEntity ?? [];
-      if (
-        data.loginOption === LoginOption.AGENT_DN &&
-        !isValidDialNumber(data.dialNumber, dialPlanEntries)
-      ) {
+      if (data.loginOption === LoginOption.AGENT_DN && !isValidDialNumber(data.dialNumber)) {
         const error = new Error('INVALID_DIAL_NUMBER');
         // @ts-ignore - adding custom key to the error object
         error.details = {data: {reason: 'INVALID_DIAL_NUMBER'}} as Failure;
@@ -1083,17 +1091,6 @@ export default class ContactCenter extends WebexPlugin implements IContactCenter
 
     if (!eventData.type) {
       return;
-    }
-
-    if (eventData.type === CC_EVENTS.REAL_TIME_TRANSCRIPTION) {
-      const interactionId =
-        eventData?.data?.data?.interactionId || eventData?.data?.data?.conversationId;
-      if (interactionId) {
-        const task = this.taskManager.getTask(interactionId);
-        if (task) {
-          task.emit(CC_EVENTS.REAL_TIME_TRANSCRIPTION, eventData.data);
-        }
-      }
     }
 
     LoggerProxy.log(`Received event: ${eventData?.data?.type ?? eventData.type}`, {
